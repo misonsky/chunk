@@ -1,0 +1,2156 @@
+import math
+import functools
+import warnings
+from collections import OrderedDict, defaultdict
+from collections import abc as container_abcs
+from copy import deepcopy
+from itertools import chain
+from typing import (
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Hashable,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+    cast,
+    overload,
+)
+from typing_extensions import ParamSpec, Self, TypeAlias
+
+import torch
+import torch.utils.hooks as hooks
+from .runtime_utils import (
+    bucket_transfer_to_device,
+    maybe_empty_cache,
+    offload_optimizer_state_to_cpu,
+    restore_optimizer_state_to_device,
+    should_lazy_resume,
+    should_async_offload,
+    should_prefetch,
+    should_sync_cuda,
+    transfer_to_cpu,
+    transfer_to_device,
+)
+from torch.utils.hooks import RemovableHandle
+from torch.utils._foreach_utils import (
+    Indices,
+    TensorListList,
+    _get_foreach_kernels_supported_devices,
+    _get_fused_kernels_supported_devices,
+)
+from torch._utils import is_compiling
+from torch.utils._foreach_utils import _group_tensors_by_device_and_dtype
+from torch.optim import Optimizer as TorchOptimizer
+import bitsandbytes.functional as F
+
+Args: TypeAlias = Tuple[Any, ...]
+Kwargs: TypeAlias = Dict[str, Any]
+StateDict: TypeAlias = Dict[str, Any]
+
+GlobalOptimizerPreHook: TypeAlias = Callable[["Optimizer", Args, Kwargs], Optional[Tuple[Args, Kwargs]]]
+GlobalOptimizerPostHook: TypeAlias = Callable[["Optimizer", Args, Kwargs], None]
+
+__all__ = ['Optimizer', 'register_optimizer_step_pre_hook', 'register_optimizer_step_post_hook']
+_global_optimizer_pre_hooks: Dict[int, GlobalOptimizerPreHook] = OrderedDict()
+_global_optimizer_post_hooks: Dict[int, GlobalOptimizerPostHook] = OrderedDict()
+_foreach_supported_types = [torch.Tensor, torch.nn.parameter.Parameter]
+
+class _RequiredParameter:
+    """Singleton class representing a required parameter for an Optimizer."""
+    def __repr__(self) -> str:
+        return "<required parameter>"
+
+required = _RequiredParameter()
+
+
+def _use_grad_for_differentiable(func):
+    def _use_grad(self, *args, **kwargs):
+        import torch._dynamo
+        prev_grad = torch.is_grad_enabled()
+        try:
+            # Note on graph break below:
+            # we need to graph break to ensure that aot respects the no_grad annotation.
+            # This is important for perf because without this, functionalization will generate an epilogue
+            # which updates the mutated parameters of the optimizer which is *not* visible to inductor, as a result,
+            # inductor will allocate for every parameter in the model, which is horrible.
+            # With this, aot correctly sees that this is an inference graph, and functionalization will generate
+            # an epilogue which is appended to the graph, which *is* visible to inductor, as a result, inductor sees that
+            # step is in place and is able to avoid the extra allocation.
+            # In the future, we will either 1) continue to graph break on backward, so this graph break does not matter
+            # or 2) have a fully fused forward and backward graph, which will have no_grad by default, and we can remove this
+            # graph break to allow the fully fused fwd-bwd-optimizer graph to be compiled.
+            # see https://github.com/pytorch/pytorch/issues/104053
+            torch.set_grad_enabled(self.defaults['differentiable'])
+            torch._dynamo.graph_break()
+            ret = func(self, *args, **kwargs)
+        finally:
+            torch._dynamo.graph_break()
+            torch.set_grad_enabled(prev_grad)
+        return ret
+    functools.update_wrapper(_use_grad, func)
+    return _use_grad
+
+def _get_value(x):
+    # item is significantly faster than a cpu tensor in eager mode
+    if not torch.jit.is_scripting() and is_compiling():
+        return x
+    else:
+        return x.item()
+
+def _stack_if_compiling(x):
+    if not torch.jit.is_scripting() and is_compiling():
+        return torch.stack(x)
+    else:
+        return x
+
+def _dispatch_sqrt(x: float):  # float annotation is needed because of torchscript type inference
+    if not torch.jit.is_scripting() and isinstance(x, torch.Tensor):
+        return x.sqrt()
+    else:
+        return math.sqrt(x)
+
+# For any optimizer with a faster implementation, we attempt to default to the
+# fastest + stablest whenever possible. For foreach, the requirements are to have
+# native params all on CUDA. For fused, there's currently the additional requirement
+# that the tensors' dtypes must be floating point. Neither alternative supports
+# torch.jit.script nor differentiable, so we fall back to the single tensor
+# implementation in those cases.
+def _default_to_fused_or_foreach(params: List[torch.Tensor],
+                                 differentiable: bool,
+                                 use_fused: bool = False) -> Tuple[bool, bool]:
+    if torch.jit.is_scripting() or differentiable:
+        return False, False
+
+    fused_supported_devices = _get_fused_kernels_supported_devices()
+    foreach_supported_devices = _get_foreach_kernels_supported_devices()
+    fused = use_fused and all(
+        p is None or (type(p) in _foreach_supported_types and
+                      p.device.type in fused_supported_devices and
+                      torch.is_floating_point(p)) for p in params
+    )
+    foreach = not fused and all(
+        p is None or (type(p) in _foreach_supported_types and
+                      p.device.type in foreach_supported_devices) for p in params
+    )
+    return fused, foreach
+
+
+# Common doc strings among optimizers
+_foreach_doc = r"""foreach (bool, optional): whether foreach implementation of optimizer
+            is used. If unspecified by the user (so foreach is None), we will try to use
+            foreach over the for-loop implementation on CUDA, since it is usually
+            significantly more performant. Note that the foreach implementation uses
+            ~ sizeof(params) more peak memory than the for-loop version due to the intermediates
+            being a tensorlist vs just one tensor. If memory is prohibitive, batch fewer
+            parameters through the optimizer at a time or switch this flag to False (default: None)"""
+
+_fused_doc = r"""fused (bool, optional): whether the fused implementation (CUDA only) is used.
+            Currently, `torch.float64`, `torch.float32`, `torch.float16`, and `torch.bfloat16`
+            are supported. (default: None)
+
+    .. note:: The foreach and fused implementations are typically faster than the for-loop,
+              single-tensor implementation. Thus, if the user has not specified BOTH flags
+              (i.e., when foreach = fused = None), we will attempt defaulting to the foreach
+              implementation when the tensors are all on CUDA. For example, if the user specifies
+              True for fused but nothing for foreach, we will run the fused implementation. If
+              the user specifies False for foreach but nothing for fused (or False for fused but
+              nothing for foreach), we will run the for-loop implementation. If the user specifies
+              True for both foreach and fused, we will prioritize fused over foreach, as it is
+              typically faster. We attempt to use the fastest, so the hierarchy goes fused ->
+              foreach -> for-loop. HOWEVER, since the fused implementation is relatively new,
+              we want to give it sufficient bake-in time, so we default to foreach and NOT
+              fused when the user has not specified either flag."""
+
+_capturable_doc = r"""capturable (bool, optional): whether this instance is safe to
+            capture in a CUDA graph. Passing True can impair ungraphed performance,
+            so if you don't intend to graph capture this instance, leave it False
+            (default: False)"""
+
+_differentiable_doc = r"""differentiable (bool, optional): whether autograd should
+            occur through the optimizer step in training. Otherwise, the step()
+            function runs in a torch.no_grad() context. Setting to True can impair
+            performance, so leave it False if you don't intend to run autograd
+            through this instance (default: False)"""
+
+_maximize_doc = r"""maximize (bool, optional): maximize the params based on the
+            objective, instead of minimizing (default: False)"""
+
+
+def register_optimizer_step_pre_hook(hook: GlobalOptimizerPreHook) -> RemovableHandle:
+    r"""Register a pre hook common to all optimizers. The hook should have the following
+    signature::
+
+        hook(optimizer, args, kwargs) -> None or modified args and kwargs
+
+    Args:
+        hook (Callable): A user defined hook which is registered on all optimizers.
+
+    Returns:
+        :class:`torch.utils.hooks.RemovableHandle`:
+            a handle that can be used to remove the added hook by calling
+            ``handle.remove()``
+    """
+    handle = hooks.RemovableHandle(_global_optimizer_pre_hooks)
+    _global_optimizer_pre_hooks[handle.id] = hook
+    return handle
+
+
+def register_optimizer_step_post_hook(hook: GlobalOptimizerPostHook) -> RemovableHandle:
+    r"""Register a post hook common to all optimizers. The hook should have the following
+    signature::
+
+        hook(optimizer, args, kwargs) -> None
+
+    Args:
+        hook (Callable): A user defined hook which is registered on all optimizers.
+
+    Returns:
+        :class:`torch.utils.hooks.RemovableHandle`:
+            a handle that can be used to remove the added hook by calling
+            ``handle.remove()``
+    """
+    handle = hooks.RemovableHandle(_global_optimizer_post_hooks)
+    _global_optimizer_post_hooks[handle.id] = hook
+    return handle
+
+params_t: TypeAlias = Union[Iterable[torch.Tensor], Iterable[Dict[str, Any]]]
+
+_P = ParamSpec("_P")
+R = TypeVar("R")
+T = TypeVar("T")
+
+
+class Optimizer(TorchOptimizer):
+    r"""Base class for all optimizers.
+
+    .. warning::
+        Parameters need to be specified as collections that have a deterministic
+        ordering that is consistent between runs. Examples of objects that don't
+        satisfy those properties are sets and iterators over values of dictionaries.
+
+    Args:
+        params (iterable): an iterable of :class:`torch.Tensor` s or
+            :class:`dict` s. Specifies what Tensors should be optimized.
+        defaults: (dict): a dict containing default values of optimization
+            options (used when a parameter group doesn't specify them).
+    """
+
+    OptimizerPreHook: TypeAlias = Callable[[Self, Args, Kwargs], Optional[Tuple[Args, Kwargs]]]  # type: ignore[misc]
+    OptimizerPostHook: TypeAlias = Callable[[Self, Args, Kwargs], None]  # type: ignore[misc]
+
+    _optimizer_step_pre_hooks: Dict[int, OptimizerPreHook]
+    _optimizer_step_post_hooks: Dict[int, OptimizerPostHook]
+    _optimizer_state_dict_pre_hooks: 'OrderedDict[int, Callable[["Optimizer"], None]]'
+    _optimizer_state_dict_post_hooks: 'OrderedDict[int, Callable[["Optimizer", StateDict], Optional[StateDict]]]'
+    _optimizer_load_state_dict_pre_hooks: 'OrderedDict[int, Callable[["Optimizer", StateDict], Optional[StateDict]]]'
+    _optimizer_load_state_dict_post_hooks: 'OrderedDict[int, Callable[["Optimizer"], None]]'
+
+    def __init__(self, params: params_t, defaults: Dict[str, Any]) -> None:
+        torch._C._log_api_usage_once("python.optimizer")
+        self.defaults = defaults
+        self._optimizer_step_pre_hooks = OrderedDict()
+        self._optimizer_step_post_hooks = OrderedDict()
+        self._optimizer_state_dict_pre_hooks = OrderedDict()
+        self._optimizer_state_dict_post_hooks = OrderedDict()
+        self._optimizer_load_state_dict_pre_hooks = OrderedDict()
+        self._optimizer_load_state_dict_post_hooks = OrderedDict()
+
+        self._patch_step_function()
+
+        if isinstance(params, torch.Tensor):
+            raise TypeError("params argument given to the optimizer should be "
+                            "an iterable of Tensors or dicts, but got " +
+                            torch.typename(params))
+
+        self.state: DefaultDict[torch.Tensor, Any] = defaultdict(dict)
+        self.param_groups: List[Dict[str, Any]] = []
+        self.id_mapping  = {}
+
+        param_groups = list(params)
+        if len(param_groups) == 0:
+            raise ValueError("optimizer got an empty parameter list")
+        if not isinstance(param_groups[0], dict):
+            param_groups = [{'params': param_groups}]
+
+        for param_group in param_groups:
+            self.add_param_group(cast(dict, param_group))
+
+        # Allows _cuda_graph_capture_health_check to rig a poor man's TORCH_WARN_ONCE in python,
+        # which I don't think exists
+        # https://github.com/pytorch/pytorch/issues/72948
+        self._warned_capturable_if_run_uncaptured = True
+
+    @staticmethod
+    def _ensure_param_runtime_attrs(params: Iterable[torch.Tensor]) -> None:
+        for param in params:
+            if not hasattr(param, "new_grad"):
+                param.new_grad = None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        return {
+            'defaults': self.defaults,
+            'state': self.state,
+            'param_groups': self.param_groups,
+        }
+    
+    def get_state_key(self,p):
+        if len(self.id_mapping) > 0:
+            key_id = self.id_mapping[p]
+        else:
+            key_id = p
+        return key_id
+    def add_id_mapping(self,values):
+        self.id_mapping.update(values)
+    def clear_id_mapping(self):
+        self.id_mapping.clear()
+
+    def clear_checkpoint_transients(self):
+        self.clear_id_mapping()
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        if '_optimizer_step_pre_hooks' not in self.__dict__:
+            self._optimizer_step_pre_hooks = OrderedDict()
+        if '_optimizer_step_post_hooks' not in self.__dict__:
+            self._optimizer_step_post_hooks = OrderedDict()
+        if '_optimizer_state_dict_pre_hooks' not in self.__dict__:
+            self._optimizer_state_dict_pre_hooks = OrderedDict()
+        if '_optimizer_state_dict_post_hooks' not in self.__dict__:
+            self._optimizer_state_dict_post_hooks = OrderedDict()
+        if '_optimizer_load_state_dict_pre_hooks' not in self.__dict__:
+            self._optimizer_load_state_dict_pre_hooks = OrderedDict()
+        if '_optimizer_load_state_dict_post_hooks' not in self.__dict__:
+            self._optimizer_load_state_dict_post_hooks = OrderedDict()
+        self._patch_step_function()  # To support multiprocessing pickle/unpickle
+        self.defaults.setdefault('differentiable', False)
+        for group in self.param_groups:
+            self._ensure_param_runtime_attrs(group.get("params", []))
+
+    def __repr__(self) -> str:
+        format_string = self.__class__.__name__ + ' ('
+        for i, group in enumerate(self.param_groups):
+            format_string += '\n'
+            format_string += f'Parameter Group {i}\n'
+            for key in sorted(group.keys()):
+                if key != 'params':
+                    format_string += f'    {key}: {group[key]}\n'
+        format_string += ')'
+        return format_string
+
+    # Currently needed by Adam and AdamW
+    def _cuda_graph_capture_health_check(self) -> None:
+        # Note [torch.compile x capturable]
+        # If we are compiling, we try to take the capturable path automatically by
+        # setting the flag to True during tracing. Due to this, we skip all the checks
+        # normally required for determining whether we can use CUDA graphs and
+        # shunt the responsibility to torch.inductor. This saves time during tracing
+        # since the checks are slow without sacrificing UX since inductor will warn
+        # later if CUDA graphs cannot be enabled, e.g.,
+        # https://github.com/pytorch/pytorch/blob/d3ba8901d8640eb16f88b2bfef9df7fa383d4b47/torch/_inductor/compile_fx.py#L390.
+        # Thus, when compiling, inductor will determine if cudagraphs
+        # can be enabled based on whether there is input mutation or CPU tensors.
+        if not is_compiling() and torch.backends.cuda.is_built() and torch.cuda.is_available():
+            capturing = torch.cuda.is_current_stream_capturing()
+
+            if capturing and not all(group['capturable'] for group in self.param_groups):
+                raise RuntimeError("Attempting CUDA graph capture of step() for an instance of " +
+                                   self.__class__.__name__ +
+                                   " but param_groups' capturable is False.")
+
+            if (
+                (not getattr(self, "_warned_capturable_if_run_uncaptured", False))
+                and all(group['capturable'] for group in self.param_groups)
+                and (not capturing)
+            ):
+                warnings.warn(
+                    "This instance was constructed with capturable=True or some of all the param_groups came with capturable=True, "
+                    "but step() is running without CUDA graph capture. If you never intend to graph-capture this "
+                    "instance, capturable=True can impair performance, and you should set capturable=False."
+                )
+                self._warned_capturable_if_run_uncaptured = True
+
+    def _optimizer_step_code(self) -> None:
+        """Entry point for `torch.profile.profiler`.
+
+        When python tracing is enabled the profiler will hook into this
+        function at the CPython level to inspect the optimizer's parameters and
+        param groups. It is called it after `step()` since many optimizers
+        lazily initialize state.
+
+        This is a workaround due to lack of a proper step hook on the optimizer,
+        and will be removed if it exists.
+        """
+        pass
+
+    @staticmethod
+    def profile_hook_step(func: Callable[_P, R]) -> Callable[_P, R]:
+
+        @functools.wraps(func)
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> R:
+            self, *_ = args
+            self = cast(Optimizer, self)
+            profile_name = f"Optimizer.step#{self.__class__.__name__}.step"
+            with torch.autograd.profiler.record_function(profile_name):
+                # call optimizer step pre hooks
+                for pre_hook in chain(_global_optimizer_pre_hooks.values(), self._optimizer_step_pre_hooks.values()):
+                    result = pre_hook(self, args, kwargs)
+                    if result is not None:
+                        if isinstance(result, tuple) and len(result) == 2:
+                            args, kwargs = result  # type: ignore[assignment]
+                        else:
+                            raise RuntimeError(
+                                f"{func} must return None or a tuple of (new_args, new_kwargs), but got {result}."
+                            )
+
+                out = func(*args, **kwargs)
+                self._optimizer_step_code()
+
+                # call optimizer step post hooks
+                for post_hook in chain(self._optimizer_step_post_hooks.values(), _global_optimizer_post_hooks.values()):
+                    post_hook(self, args, kwargs)
+
+                return out
+
+        return wrapper
+
+    @staticmethod
+    def _group_tensors_by_device_and_dtype(
+        tensorlistlist: TensorListList,
+        with_indices: bool = False,
+    ) -> Union[
+        Dict[Tuple[None, None], Tuple[TensorListList, Indices]],
+        Dict[Tuple[torch.device, torch.dtype], Tuple[TensorListList, Indices]],
+    ]:
+        """Groups a list of lists of tensors by device and dtype.
+        Skips this step if we are compiling since this will occur during inductor lowering."""
+        if is_compiling():
+            return {(None, None): (tensorlistlist, list(range(len(tensorlistlist[0]))))}
+        else:
+            return _group_tensors_by_device_and_dtype(tensorlistlist, with_indices)
+
+    def _patch_step_function(self) -> None:
+        self._zero_grad_profile_name = f"Optimizer.zero_grad#{self.__class__.__name__}.zero_grad"
+        hooked = getattr(self.__class__.step, "hooked", None)
+        if not hooked:
+            self.__class__.step = self.profile_hook_step(self.__class__.step)  # type: ignore[assignment]
+            self.__class__.step.hooked = True  # type: ignore[attr-defined]
+
+    def register_step_pre_hook(self, hook: OptimizerPreHook) -> RemovableHandle:
+        r"""Register an optimizer step pre hook which will be called before
+        optimizer step. It should have the following signature::
+
+            hook(optimizer, args, kwargs) -> None or modified args and kwargs
+
+        The ``optimizer`` argument is the optimizer instance being used. If
+        args and kwargs are modified by the pre-hook, then the transformed
+        values are returned as a tuple containing the new_args and new_kwargs.
+
+        Args:
+            hook (Callable): The user defined hook to be registered.
+
+        Returns:
+            :class:`torch.utils.hooks.RemovableHandle`:
+                a handle that can be used to remove the added hook by calling
+                ``handle.remove()``
+        """
+        handle = hooks.RemovableHandle(self._optimizer_step_pre_hooks)
+        self._optimizer_step_pre_hooks[handle.id] = hook
+        return handle
+
+    def register_step_post_hook(self, hook: OptimizerPostHook) -> RemovableHandle:
+        r"""Register an optimizer step post hook which will be called after optimizer step.
+        It should have the following signature::
+
+            hook(optimizer, args, kwargs) -> None
+
+        The ``optimizer`` argument is the optimizer instance being used.
+
+        Args:
+            hook (Callable): The user defined hook to be registered.
+
+        Returns:
+            :class:`torch.utils.hooks.RemovableHandle`:
+                a handle that can be used to remove the added hook by calling
+                ``handle.remove()``
+        """
+        handle = hooks.RemovableHandle(self._optimizer_step_post_hooks)
+        self._optimizer_step_post_hooks[handle.id] = hook
+        return handle
+
+
+    def register_state_dict_pre_hook(
+        self, hook: Callable[["Optimizer"], None], prepend: bool = False
+    ) -> RemovableHandle:
+        r"""Register a state dict pre-hook which will be called before
+        :meth:`~torch.optim.Optimizer.state_dict` is called. It should have the
+        following signature::
+
+            hook(optimizer) -> None
+
+        The ``optimizer`` argument is the optimizer instance being used.
+        The hook will be called with argument ``self`` before calling ``state_dict`` on ``self``.
+        The registered hook can be used to perform pre-processing before the ``state_dict``
+        call is made.
+
+        Args:
+            hook (Callable): The user defined hook to be registered.
+            prepend (bool): If True, the provided pre ``hook`` will be fired before
+                all the already registered pre-hooks on ``state_dict``. Otherwise,
+                the provided ``hook`` will be fired after all the already registered
+                pre-hooks. (default: False)
+
+        Returns:
+            :class:`torch.utils.hooks.RemoveableHandle`:
+                a handle that can be used to remove the added hook by calling
+                ``handle.remove()``
+        """
+        handle = hooks.RemovableHandle(self._optimizer_state_dict_pre_hooks)
+        self._optimizer_state_dict_pre_hooks[handle.id] = hook
+        if prepend:
+            self._optimizer_state_dict_pre_hooks.move_to_end(handle.id, last=False)
+        return handle
+
+
+    def register_state_dict_post_hook(
+        self,
+        hook: Callable[["Optimizer", StateDict], Optional[StateDict]],
+        prepend: bool = False,
+    ) -> RemovableHandle:
+        r"""Register a state dict post-hook which will be called after
+        :meth:`~torch.optim.Optimizer.state_dict` is called. It should have the
+        following signature::
+
+            hook(optimizer, state_dict) -> state_dict or None
+
+        The hook will be called with arguments ``self`` and ``state_dict`` after generating
+        a ``state_dict`` on ``self``. The hook may modify the state_dict inplace or optionally
+        return a new one. The registered hook can be used to perform post-processing
+        on the ``state_dict`` before it is returned.
+
+        Args:
+            hook (Callable): The user defined hook to be registered.
+            prepend (bool): If True, the provided post ``hook`` will be fired before
+                all the already registered post-hooks on ``state_dict``. Otherwise,
+                the provided ``hook`` will be fired after all the already registered
+                post-hooks. (default: False)
+
+        Returns:
+            :class:`torch.utils.hooks.RemoveableHandle`:
+                a handle that can be used to remove the added hook by calling
+                ``handle.remove()``
+        """
+        handle = hooks.RemovableHandle(self._optimizer_state_dict_post_hooks)
+        self._optimizer_state_dict_post_hooks[handle.id] = hook
+        if prepend:
+            self._optimizer_state_dict_post_hooks.move_to_end(handle.id, last=False)
+        return handle
+
+
+    @torch._disable_dynamo
+    def state_dict(self) -> StateDict:
+        r"""Returns the state of the optimizer as a :class:`dict`.
+
+        It contains two entries:
+
+        * ``state``: a Dict holding current optimization state. Its content
+            differs between optimizer classes, but some common characteristics
+            hold. For example, state is saved per parameter, and the parameter
+            itself is NOT saved. ``state`` is a Dictionary mapping parameter ids
+            to a Dict with state corresponding to each parameter.
+        * ``param_groups``: a List containing all parameter groups where each
+            parameter group is a Dict. Each parameter group contains metadata
+            specific to the optimizer, such as learning rate and weight decay,
+            as well as a List of parameter IDs of the parameters in the group.
+
+        NOTE: The parameter IDs may look like indices but they are just IDs
+        associating state with param_group. When loading from a state_dict,
+        the optimizer will zip the param_group ``params`` (int IDs) and the
+        optimizer ``param_groups`` (actual ``nn.Parameter`` s) in order to
+        match state WITHOUT additional verification.
+
+        A returned state dict might look something like:
+
+        .. code-block:: text
+
+            {
+                'state': {
+                    0: {'momentum_buffer': tensor(...), ...},
+                    1: {'momentum_buffer': tensor(...), ...},
+                    2: {'momentum_buffer': tensor(...), ...},
+                    3: {'momentum_buffer': tensor(...), ...}
+                },
+                'param_groups': [
+                    {
+                        'lr': 0.01,
+                        'weight_decay': 0,
+                        ...
+                        'params': [0]
+                    },
+                    {
+                        'lr': 0.001,
+                        'weight_decay': 0.5,
+                        ...
+                        'params': [1, 2, 3]
+                    }
+                ]
+            }
+
+        """
+
+        self.clear_checkpoint_transients()
+        for pre_hook in self._optimizer_state_dict_pre_hooks.values():
+            pre_hook(self)
+
+        # Save order indices instead of Tensors
+        param_mappings: Dict[int, int] = {}
+        start_index = 0
+
+        def pack_group(group: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal start_index
+            packed = {k: v for k, v in group.items() if k != 'params'}
+            param_mappings.update({id(p): i for i, p in enumerate(group['params'], start_index)
+                                   if id(p) not in param_mappings})
+            packed['params'] = [param_mappings[id(p)] for p in group['params']]
+            start_index += len(packed['params'])
+            return packed
+        param_groups = [pack_group(g) for g in self.param_groups]
+        # Remap state to use order indices as keys
+        # packed_state = {(param_mappings[id(k)] if isinstance(k, torch.Tensor) else k): v
+        #                 for k, v in self.state.items()}
+        packed_state = {}
+        increment_num = 0
+        for k, v in self.state.items():
+            if isinstance(k, torch.Tensor):
+                if id(k) in param_mappings:
+                    packed_state[param_mappings[id(k)]]=v
+                else:
+                    packed_state[start_index+increment_num] = v
+                    increment_num +=1
+            else:
+                packed_state[k] = v
+
+        state_dict = {
+            'state': packed_state,
+            'param_groups': param_groups,
+        }
+
+        for post_hook in self._optimizer_state_dict_post_hooks.values():
+            hook_result = post_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+        return state_dict
+
+    @staticmethod
+    def _process_value_according_to_param_policy(
+        param: torch.Tensor,
+        value: torch.Tensor,
+        param_id: int,
+        param_groups: List[Dict[Any, Any]],
+        key: Hashable = None,
+    ) -> torch.Tensor:
+        # Floating-point types are a bit special here. They are the only ones
+        # that are assumed to always match the type of params.
+        # Make sure state['step'] is not casted https://github.com/pytorch/pytorch/issues/74424
+        # UNLESS fused or capturable, see note [special device hosting for step]
+        fused = False
+        capturable = False
+        assert param_groups is not None
+        for pg in param_groups:
+            if param_id in pg["params"]:
+                fused = pg["fused"] if "fused" in pg else False
+                capturable = pg["capturable"] if "capturable" in pg else False
+                break
+
+        if key == 'step':
+            if capturable or fused:
+                return value.to(dtype=torch.float32, device=param.device)
+            else:
+                return value
+        else:
+            if param.is_floating_point():
+                return value.to(dtype=param.dtype, device=param.device)
+            else:
+                return value.to(device=param.device)
+
+
+    def register_load_state_dict_pre_hook(
+        self,
+        hook: Callable[["Optimizer", StateDict], Optional[StateDict]],
+        prepend: bool = False,
+    ) -> RemovableHandle:
+        r"""Register a load_state_dict pre-hook which will be called before
+        :meth:`~torch.optim.Optimizer.load_state_dict` is called. It should have the
+        following signature::
+
+            hook(optimizer, state_dict) -> state_dict or None
+
+        The ``optimizer`` argument is the optimizer instance being used and the
+        ``state_dict`` argument is a shallow copy of the ``state_dict`` the user
+        passed in to ``load_state_dict``. The hook may modify the state_dict inplace
+        or optionally return a new one. If a state_dict is returned, it will be used
+        to be loaded into the optimizer.
+
+        The hook will be called with argument ``self`` and ``state_dict`` before
+        calling ``load_state_dict`` on ``self``. The registered hook can be used to
+        perform pre-processing before the ``load_state_dict`` call is made.
+
+        Args:
+            hook (Callable): The user defined hook to be registered.
+            prepend (bool): If True, the provided pre ``hook`` will be fired before
+                all the already registered pre-hooks on ``load_state_dict``. Otherwise,
+                the provided ``hook`` will be fired after all the already registered
+                pre-hooks. (default: False)
+
+        Returns:
+            :class:`torch.utils.hooks.RemoveableHandle`:
+                a handle that can be used to remove the added hook by calling
+                ``handle.remove()``
+        """
+        handle = hooks.RemovableHandle(self._optimizer_load_state_dict_pre_hooks)
+        self._optimizer_load_state_dict_pre_hooks[handle.id] = hook
+        if prepend:
+            self._optimizer_load_state_dict_pre_hooks.move_to_end(handle.id, last=False)
+        return handle
+
+
+    def register_load_state_dict_post_hook(
+        self, hook: Callable[["Optimizer"], None], prepend: bool = False
+    ) -> RemovableHandle:
+        r"""Register a load_state_dict post-hook which will be called after
+        :meth:`~torch.optim.Optimizer.load_state_dict` is called. It should have the
+        following signature::
+
+            hook(optimizer) -> None
+
+        The ``optimizer`` argument is the optimizer instance being used.
+
+        The hook will be called with argument ``self`` after calling
+        ``load_state_dict`` on ``self``. The registered hook can be used to
+        perform post-processing after ``load_state_dict`` has loaded the
+        ``state_dict``.
+
+        Args:
+            hook (Callable): The user defined hook to be registered.
+            prepend (bool): If True, the provided post ``hook`` will be fired before
+                all the already registered post-hooks on ``load_state_dict``. Otherwise,
+                the provided ``hook`` will be fired after all the already registered
+                post-hooks. (default: False)
+
+        Returns:
+            :class:`torch.utils.hooks.RemoveableHandle`:
+                a handle that can be used to remove the added hook by calling
+                ``handle.remove()``
+        """
+        handle = hooks.RemovableHandle(self._optimizer_load_state_dict_post_hooks)
+        self._optimizer_load_state_dict_post_hooks[handle.id] = hook
+        if prepend:
+            self._optimizer_load_state_dict_post_hooks.move_to_end(handle.id, last=False)  # type: ignore[attr-defined]
+        return handle
+
+
+    @torch._disable_dynamo
+    def load_state_dict(self, state_dict: StateDict) -> None:
+        r"""Loads the optimizer state.
+
+        Args:
+            state_dict (dict): optimizer state. Should be an object returned
+                from a call to :meth:`state_dict`.
+        """
+        self.clear_checkpoint_transients()
+        # shallow copy, to be consistent with module API
+        state_dict = state_dict.copy()
+
+        for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
+            hook_result = pre_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+
+        # Validate the state_dict
+        groups = self.param_groups
+
+        # We only replace the `params` field later, so a shallow per-group copy is enough.
+        saved_groups = [dict(g) for g in state_dict.pop('param_groups')]
+
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of "
+                             "parameter groups")
+        param_lens = (len(g['params']) for g in groups)
+        saved_lens = (len(g['params']) for g in saved_groups)
+        if any(p_len != s_len for p_len, s_len in zip(param_lens, saved_lens)):
+            raise ValueError("loaded state dict contains a parameter group "
+                             "that doesn't match the size of optimizer's group")
+
+        # Update the state
+        id_map = dict(zip(chain.from_iterable(g['params'] for g in saved_groups),
+                      chain.from_iterable(g['params'] for g in groups)))
+
+        def _cast(param, value, param_id=None, param_groups=None, key=None):
+            r"""Make a deep copy of value, casting all tensors to device of param."""
+            if isinstance(value, torch.Tensor):
+                return Optimizer._process_value_according_to_param_policy(param, value, param_id, param_groups, key)
+            elif isinstance(value, dict):
+                return {k: _cast(param, v, param_id=param_id, param_groups=param_groups, key=k) for k, v in value.items()}
+            elif isinstance(value, Iterable):
+                return type(value)(_cast(param, v, param_id=param_id, param_groups=param_groups) for v in value)  # type: ignore[call-arg]
+            else:
+                return value
+
+        # Copy state assigned to params (and cast tensors to appropriate types).
+        # State that is not assigned to params is copied as is (needed for
+        # backward compatibility).
+        state: DefaultDict[torch.Tensor, Dict[Any, Any]] = defaultdict(dict)
+        saved_state = state_dict.pop('state')
+        for k, v in saved_state.items():
+            if k in id_map:
+                param = id_map[k]
+                state[param] = _cast(param, v, param_id=k, param_groups=saved_groups)
+            else:
+                state[k] = v
+
+        # Update parameter groups, setting their 'params' value
+        def update_group(group: Dict[str, Any], new_group: Dict[str, Any]) -> Dict[str, Any]:
+            new_group['params'] = group['params']
+            return new_group
+        param_groups = [
+            update_group(g, ng) for g, ng in zip(groups, saved_groups)]
+        self.__setstate__({'state': state, 'param_groups': param_groups})
+
+        for post_hook in self._optimizer_load_state_dict_post_hooks.values():
+            post_hook(self)
+
+
+    @torch._disable_dynamo
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        r"""Resets the gradients of all optimized :class:`torch.Tensor` s.
+
+        Args:
+            set_to_none (bool): instead of setting to zero, set the grads to None.
+                This will in general have lower memory footprint, and can modestly improve performance.
+                However, it changes certain behaviors. For example:
+                1. When the user tries to access a gradient and perform manual ops on it,
+                a None attribute or a Tensor full of 0s will behave differently.
+                2. If the user requests ``zero_grad(set_to_none=True)`` followed by a backward pass, ``.grad``\ s
+                are guaranteed to be None for params that did not receive a gradient.
+                3. ``torch.optim`` optimizers have a different behavior if the gradient is 0 or None
+                (in one case it does the step with a gradient of 0 and in the other it skips
+                the step altogether).
+        """
+        foreach = self.defaults.get('foreach', False) or self.defaults.get('fused', False)
+
+        if not hasattr(self, "_zero_grad_profile_name"):
+            self._patch_step_function()
+
+        per_device_and_dtype_grads: Optional[DefaultDict[torch.device, DefaultDict[torch.dtype, List[torch.Tensor]]]]
+        if foreach:
+            per_device_and_dtype_grads = defaultdict(lambda: defaultdict(list))
+        else:
+            per_device_and_dtype_grads = None
+
+        with torch.autograd.profiler.record_function(self._zero_grad_profile_name):
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.new_grad is not None:
+                        if set_to_none:
+                            p.new_grad = None
+                        else:
+                            if p.grad.grad_fn is not None:
+                                p.grad.detach_()
+                            else:
+                                p.grad.requires_grad_(False)
+                            if (not foreach or p.grad.is_sparse):
+                                p.grad.zero_()
+                            else:
+                                assert per_device_and_dtype_grads is not None
+                                per_device_and_dtype_grads[p.grad.device][p.grad.dtype].append(p.grad)
+            if foreach:
+                assert per_device_and_dtype_grads is not None
+                for per_dtype_grads in per_device_and_dtype_grads.values():
+                    for grads in per_dtype_grads.values():
+                        torch._foreach_zero_(grads)
+
+    @overload
+    def step(self, closure: None = ...) -> None:
+        ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float:
+        ...
+
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+        r"""Performs a single optimization step (parameter update).
+
+        Args:
+            closure (Callable): A closure that reevaluates the model and
+                returns the loss. Optional for most optimizers.
+
+        .. note::
+            Unless otherwise specified, this function should not modify the
+            ``.grad`` field of the parameters.
+        """
+        raise NotImplementedError
+
+    @torch._disable_dynamo
+    def add_param_group(self, param_group: Dict[str, Any]) -> None:
+        r"""Add a param group to the :class:`Optimizer` s `param_groups`.
+
+        This can be useful when fine tuning a pre-trained network as frozen layers can be made
+        trainable and added to the :class:`Optimizer` as training progresses.
+
+        Args:
+            param_group (dict): Specifies what Tensors should be optimized along with group
+                specific optimization options.
+        """
+        if not isinstance(param_group, dict):
+            raise TypeError(f"param_group must be a dict, but got {type(param_group)}")
+
+        params = param_group['params']
+        if isinstance(params, torch.Tensor):
+            param_group['params'] = [params]
+        elif isinstance(params, set):
+            raise TypeError('optimizer parameters need to be organized in ordered collections, but '
+                            'the ordering of tensors in sets will change between runs. Please use a list instead.')
+        else:
+            param_group['params'] = list(params)
+
+        for param in param_group['params']:
+            if not isinstance(param, torch.Tensor):
+                raise TypeError("optimizer can only optimize Tensors, "
+                                "but one of the params is " + torch.typename(param))
+            if not self.defaults.get('differentiable', None) and not (param.is_leaf or param.retains_grad):
+                raise ValueError("can't optimize a non-leaf Tensor")
+        self._ensure_param_runtime_attrs(param_group["params"])
+
+        for name, default in self.defaults.items():
+            if default is required and name not in param_group:
+                raise ValueError(f"parameter group didn't specify a value of required optimization parameter {name}")
+            else:
+                param_group.setdefault(name, default)
+
+        params = param_group['params']
+        if len(params) != len(set(params)):
+            warnings.warn("optimizer contains a parameter group with duplicate parameters; "
+                          "in future, this will cause an error; "
+                          "see github.com/pytorch/pytorch/issues/40967 for more information", stacklevel=3)
+
+        param_set: Set[torch.Tensor] = set()
+        for group in self.param_groups:
+            param_set.update(set(group['params']))
+
+        if not param_set.isdisjoint(set(param_group['params'])):
+            raise ValueError("some parameters appear in more than one parameter group")
+
+        self.param_groups.append(param_group)
+
+class MockArgs:
+    def __init__(self, initial_data):
+        for key in initial_data:
+            setattr(self, key, initial_data[key])
+
+class GlobalOptimManager:
+    """
+    A global optimizer manager for enabling custom optimizer configs.
+    """
+
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        self.pid2config = {}
+        self.index2config = {}
+        self.optimizer = None
+        self.uses_config_override = False
+        self.module_weight_config_triple = []
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+    def register_parameters(self, params):
+        param_groups = list(params)
+        if not isinstance(param_groups[0], dict):
+            param_groups = [{"params": param_groups}]
+
+        for group_index, group in enumerate(param_groups):
+            for p_index, p in enumerate(group["params"]):
+                if id(p) in self.pid2config:
+                    self.index2config[(group_index, p_index)] = self.pid2config[id(p)]
+
+    def override_config(self, parameters, key=None, value=None, key_value_dict=None):
+        """
+        Override initial optimizer config with specific hyperparameters.
+
+        The key-values of the optimizer config for the input parameters are overridden
+        This can be both, optimizer parameters like `betas` or `lr`, or it can be
+        8-bit specific parameters like `optim_bits` or `percentile_clipping`.
+
+        Arguments:
+           parameters (`torch.Tensor` or `list(torch.Tensors)`):
+             The input parameters.
+           key (`str`):
+             The hyperparamter to override.
+           value:
+             The hyperparameter values.
+           key_value_dict (`dict`):
+             A dictionary with multiple key-values to override.
+
+        Example:
+
+        ```py
+        import torch
+        import bitsandbytes as bnb
+
+        mng = bnb.optim.GlobalOptimManager.get_instance()
+
+        model = MyModel()
+        mng.register_parameters(model.parameters()) # 1. register parameters while still on CPU
+
+        model = model.cuda()
+        # use 8-bit optimizer states for all parameters
+        adam = bnb.optim.Adam(model.parameters(), lr=0.001, optim_bits=8)
+
+        # 2. override: the parameter model.fc1.weight now uses 32-bit Adam
+        mng.override_config(model.fc1.weight, 'optim_bits', 32)
+        ```
+        """
+        self.uses_config_override = True
+        if isinstance(parameters, torch.nn.Parameter):
+            parameters = [parameters]
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        if key is not None and value is not None:
+            assert key_value_dict is None
+            key_value_dict = {key: value}
+
+        if key_value_dict is not None:
+            for p in parameters:
+                if id(p) in self.pid2config:
+                    self.pid2config[id(p)].update(key_value_dict)
+                else:
+                    self.pid2config[id(p)] = key_value_dict
+
+    def register_module_override(self, module, param_name, config):
+        self.module_weight_config_triple.append((module, param_name, config))
+
+class Optimizer8bit(Optimizer):
+    def __init__(self, params, defaults, optim_bits=32, is_paged=False):
+        """
+        Base 8-bit optimizer class.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(params, defaults)
+        self.initialized = False
+        self.name2qmap = {}
+        self.is_paged = is_paged
+        self.page_mng = F.GlobalPageManager.get_instance()
+        self.state_cpu_buffers = defaultdict(dict)
+        self.state_cpu_buffer_dtypes = defaultdict(dict)
+        self.prefetched_state_tensors = defaultdict(dict)
+
+        self.mng = GlobalOptimManager.get_instance()
+        self.non_castable_tensor_keys = {
+            "qmap1",
+            "qmap2",
+            "max1",
+            "max2",
+            "new_max1",
+            "new_max2",
+            "state1",
+            "state2",
+            "gnorm_vec",
+            "absmax1",
+            "absmax2",
+            "unorm_vec",
+        }
+        self.offloadable_state_tensor_keys = {
+            "state1",
+            "state2",
+            "max1",
+            "max2",
+            "new_max1",
+            "new_max2",
+            "gnorm_vec",
+            "absmax1",
+            "absmax2",
+            "unorm_vec",
+        }
+        self.persistent_device_state_tensor_keys = {"qmap1", "qmap2"}
+        if optim_bits == 8:
+            self.fill_qmap()
+
+    def fill_qmap(self):
+        self.name2qmap["dynamic"] = F.create_dynamic_map(signed=True)
+        self.name2qmap["udynamic"] = F.create_dynamic_map(signed=False)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if not hasattr(self, "state_cpu_buffers"):
+            self.state_cpu_buffers = defaultdict(dict)
+        if not hasattr(self, "state_cpu_buffer_dtypes"):
+            self.state_cpu_buffer_dtypes = defaultdict(dict)
+        if not hasattr(self, "prefetched_state_tensors"):
+            self.prefetched_state_tensors = defaultdict(dict)
+        if not hasattr(self, "offloadable_state_tensor_keys"):
+            self.offloadable_state_tensor_keys = {
+                "state1",
+                "state2",
+                "max1",
+                "max2",
+                "new_max1",
+                "new_max2",
+                "gnorm_vec",
+                "absmax1",
+                "absmax2",
+                "unorm_vec",
+            }
+        if not hasattr(self, "persistent_device_state_tensor_keys"):
+            self.persistent_device_state_tensor_keys = {"qmap1", "qmap2"}
+        if getattr(self, "_defer_state_cpu_buffer_refresh", False):
+            self.state_cpu_buffers = defaultdict(dict)
+            self.state_cpu_buffer_dtypes = defaultdict(dict)
+            self.prefetched_state_tensors = defaultdict(dict)
+            self._defer_state_cpu_buffer_refresh = False
+        else:
+            self._refresh_state_cpu_buffers()
+
+    def clear_checkpoint_transients(self):
+        super().clear_checkpoint_transients()
+        self.prefetched_state_tensors = defaultdict(dict)
+
+    def _set_state_cpu_buffer(self, key_id, state_key, tensor, counter=None, original_dtype=None):
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
+            return
+        if original_dtype is None:
+            original_dtype = self._infer_state_original_dtype(state_key, tensor)
+        if counter is None:
+            self.state_cpu_buffers[key_id][state_key] = tensor
+            self.state_cpu_buffer_dtypes[key_id][state_key] = original_dtype
+        else:
+            self.state_cpu_buffers[key_id].setdefault(state_key, {})[counter] = tensor
+            self.state_cpu_buffer_dtypes[key_id].setdefault(state_key, {})[counter] = original_dtype
+
+    def _infer_state_original_dtype(self, state_key, tensor):
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        if state_key in self.offloadable_state_tensor_keys and tensor.is_floating_point():
+            return torch.float32
+        return tensor.dtype
+
+    def _get_state_cpu_buffer(self, key_id, state_key, counter=None):
+        key_buffers = self.state_cpu_buffers.get(key_id, {})
+        if counter is None:
+            return key_buffers.get(state_key)
+        counter_buffers = key_buffers.get(state_key, {})
+        if isinstance(counter_buffers, dict):
+            return counter_buffers.get(counter)
+        return None
+
+    def _get_state_cpu_buffer_dtype(self, key_id, state_key, counter=None):
+        key_dtypes = self.state_cpu_buffer_dtypes.get(key_id, {})
+        if counter is None:
+            return key_dtypes.get(state_key)
+        counter_dtypes = key_dtypes.get(state_key, {})
+        if isinstance(counter_dtypes, dict):
+            return counter_dtypes.get(counter)
+        return None
+
+    def _clear_state_cpu_buffer(self, key_id, state_key, counter=None):
+        key_buffers = self.state_cpu_buffers.get(key_id)
+        key_dtypes = self.state_cpu_buffer_dtypes.get(key_id)
+        if not key_buffers or state_key not in key_buffers:
+            return
+        if counter is None:
+            key_buffers.pop(state_key, None)
+            if key_dtypes is not None:
+                key_dtypes.pop(state_key, None)
+        else:
+            counter_buffers = key_buffers.get(state_key)
+            if isinstance(counter_buffers, dict):
+                counter_buffers.pop(counter, None)
+                if not counter_buffers:
+                    key_buffers.pop(state_key, None)
+            if key_dtypes is not None:
+                counter_dtypes = key_dtypes.get(state_key)
+                if isinstance(counter_dtypes, dict):
+                    counter_dtypes.pop(counter, None)
+                    if not counter_dtypes:
+                        key_dtypes.pop(state_key, None)
+        if not key_buffers:
+            self.state_cpu_buffers.pop(key_id, None)
+        if key_dtypes is not None and not key_dtypes:
+            self.state_cpu_buffer_dtypes.pop(key_id, None)
+
+    def _refresh_state_cpu_buffers(self):
+        self.state_cpu_buffers = defaultdict(dict)
+        self.state_cpu_buffer_dtypes = defaultdict(dict)
+        self.prefetched_state_tensors = defaultdict(dict)
+        for key_id, values in self.state.items():
+            if not isinstance(values, dict):
+                continue
+            for state_key, state_value in values.items():
+                if state_key not in self.offloadable_state_tensor_keys:
+                    continue
+                if isinstance(state_value, torch.Tensor):
+                    self._set_state_cpu_buffer(key_id, state_key, state_value)
+                elif isinstance(state_value, dict):
+                    for counter, tensor in state_value.items():
+                        self._set_state_cpu_buffer(key_id, state_key, tensor, counter)
+
+    def _ensure_state_cpu_buffer_registered(self, key_id, state_key, tensor, counter=None):
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
+            return
+        if self._get_state_cpu_buffer(key_id, state_key, counter) is None:
+            original_dtype = self._get_state_cpu_buffer_dtype(key_id, state_key, counter)
+            self._set_state_cpu_buffer(key_id, state_key, tensor, counter, original_dtype=original_dtype)
+
+    def _get_prefetched_state_tensor(self, key_id, state_key, counter):
+        key_cache = self.prefetched_state_tensors.get(key_id, {})
+        state_cache = key_cache.get(state_key, {})
+        if isinstance(state_cache, dict):
+            return state_cache.get(counter)
+        return None
+
+    def _set_prefetched_state_tensor(self, key_id, state_key, counter, tensor, original_dtype=None):
+        if not isinstance(tensor, torch.Tensor):
+            return
+        self.prefetched_state_tensors[key_id].setdefault(state_key, {})[counter] = (tensor, original_dtype)
+
+    def _take_prefetched_state_tensor(self, key_id, state_key, counter):
+        key_cache = self.prefetched_state_tensors.get(key_id)
+        if not key_cache:
+            return None, None
+        state_cache = key_cache.get(state_key)
+        if not isinstance(state_cache, dict):
+            return None, None
+        prefetched = state_cache.pop(counter, None)
+        if not state_cache:
+            key_cache.pop(state_key, None)
+        if not key_cache:
+            self.prefetched_state_tensors.pop(key_id, None)
+        if prefetched is None:
+            return None, None
+        return prefetched
+
+    def _clear_prefetched_state_tensor(self, key_id, state_key, counter=None):
+        key_cache = self.prefetched_state_tensors.get(key_id)
+        if not key_cache:
+            return
+        if counter is None:
+            key_cache.pop(state_key, None)
+        else:
+            state_cache = key_cache.get(state_key)
+            if isinstance(state_cache, dict):
+                state_cache.pop(counter, None)
+                if not state_cache:
+                    key_cache.pop(state_key, None)
+        if not key_cache:
+            self.prefetched_state_tensors.pop(key_id, None)
+
+    def _prefetch_next_state_tensors(self, p, key_id, state):
+        if not should_prefetch() or getattr(p, "chunk_num", 1) <= 1:
+            return
+        next_counter = (p.counter + 1) % p.chunk_num
+        if next_counter == p.counter:
+            return
+        prefetch_candidates = []
+        prefetch_metadata = []
+        for state_key in self.offloadable_state_tensor_keys:
+            state_value = state.get(state_key)
+            if not isinstance(state_value, dict) or next_counter not in state_value:
+                continue
+            next_tensor = state_value[next_counter]
+            if not isinstance(next_tensor, torch.Tensor) or next_tensor.device.type != "cpu":
+                self._clear_prefetched_state_tensor(key_id, state_key, next_counter)
+                continue
+            prefetch_candidates.append(next_tensor)
+            prefetch_metadata.append(
+                (
+                    state_key,
+                    self._get_state_cpu_buffer_dtype(key_id, state_key, next_counter),
+                )
+            )
+        if not prefetch_candidates:
+            return
+        prefetched_tensors = bucket_transfer_to_device(prefetch_candidates, p.device, prefetch=True)
+        for prefetched_tensor, (state_key, original_dtype) in zip(prefetched_tensors, prefetch_metadata):
+            self._set_prefetched_state_tensor(
+                key_id,
+                state_key,
+                next_counter,
+                prefetched_tensor,
+                original_dtype=original_dtype,
+            )
+
+    def prefetch_chunk_states(self, params, target_counter=None):
+        if not should_prefetch() or not self.initialized:
+            return
+        prefetch_sources = []
+        prefetch_metadata = []
+        for p in params:
+            if not hasattr(p, "counter"):
+                continue
+            key_id = self.get_state_key(p)
+            state = self.state.get(key_id)
+            if not isinstance(state, dict) or not state:
+                continue
+            counter = p.counter if target_counter is None else target_counter
+            for state_key in self.offloadable_state_tensor_keys:
+                state_value = state.get(state_key)
+                if not isinstance(state_value, dict) or counter not in state_value:
+                    continue
+                tensor = state_value[counter]
+                if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
+                    continue
+                self._ensure_state_cpu_buffer_registered(key_id, state_key, tensor, counter)
+                if self._get_prefetched_state_tensor(key_id, state_key, counter) is not None:
+                    continue
+                prefetch_sources.append(tensor)
+                prefetch_metadata.append(
+                    (
+                        key_id,
+                        state_key,
+                        counter,
+                        self._get_state_cpu_buffer_dtype(key_id, state_key, counter),
+                    )
+                )
+        if not prefetch_sources:
+            return
+        device = params[0].device
+        prefetched_tensors = bucket_transfer_to_device(prefetch_sources, device, prefetch=True)
+        for prefetched_tensor, (key_id, state_key, counter, original_dtype) in zip(prefetched_tensors, prefetch_metadata):
+            self._set_prefetched_state_tensor(
+                key_id,
+                state_key,
+                counter,
+                prefetched_tensor,
+                original_dtype=original_dtype,
+            )
+
+    def _maybe_prepare_lazy_loaded_tensor(self, state_key, tensor):
+        if not isinstance(tensor, torch.Tensor):
+            return tensor
+        if not should_lazy_resume():
+            return tensor
+        if state_key in self.offloadable_state_tensor_keys:
+            if tensor.device.type != "cpu":
+                return tensor.detach().to("cpu")
+            return tensor
+        return tensor
+
+    def load_state_dict(self, state_dict):
+        """Load an optimizer state.
+
+        Arguments:
+            state_dict (`dict`):
+                An optimizer state (should be returned from a call to `state_dict`) to load.
+        """
+        self.clear_checkpoint_transients()
+        self._defer_state_cpu_buffer_refresh = should_lazy_resume()
+        state_dict = state_dict.copy()
+        # Validate the state_dict
+        groups = self.param_groups
+        saved_groups = [dict(g) for g in state_dict.pop("param_groups")]
+
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        param_lens = (len(g["params"]) for g in groups)
+        saved_lens = (len(g["params"]) for g in saved_groups)
+        if any(p_len != s_len for p_len, s_len in zip(param_lens, saved_lens)):
+            raise ValueError(
+                "loaded state dict contains a parameter group that doesn't match the size of optimizer's group",
+            )
+
+        # Update the state
+        id_map = {
+            old_id: p
+            for old_id, p in zip(
+                chain.from_iterable(g["params"] for g in saved_groups),
+                chain.from_iterable(g["params"] for g in groups),
+            )
+        }
+
+        def cast(param, value, state_key=None):
+            r"""Make a deep copy of value, casting all tensors to device of param."""
+            if isinstance(value, torch.Tensor):
+                value = self._maybe_prepare_lazy_loaded_tensor(state_key, value)
+                if state_key in self.non_castable_tensor_keys or state_key in self.persistent_device_state_tensor_keys:
+                    return value
+                # Floating-point types are a bit special here. They are the only ones
+                # that are assumed to always match the type of params.
+                if param.is_floating_point() and value.dtype != torch.uint8:
+                    value = value.to(param.dtype)
+                return value
+            elif isinstance(value, dict):
+                nested_state_key = state_key
+                if nested_state_key not in self.non_castable_tensor_keys and nested_state_key not in self.persistent_device_state_tensor_keys:
+                    return {k: cast(param, v, state_key=k) for k, v in value.items()}
+                return {k: cast(param, v, state_key=nested_state_key) for k, v in value.items()}
+            elif isinstance(value, container_abcs.Iterable):
+                return type(value)(cast(param, v, state_key=state_key) for v in value)
+            else:
+                return value
+
+        # Copy state assigned to params (and cast tensors to appropriate types).
+        # State that is not assigned to params is copied as is (needed for
+        # backward compatibility).
+        state = defaultdict(dict)
+        saved_state = state_dict.pop("state")
+        for k, v in saved_state.items():
+            if k in id_map:
+                param = id_map[k]
+                state[param] = cast(param, v)
+            else:
+                state[k] = v
+
+        # Update parameter groups, setting their 'params' value
+        def update_group(group, new_group):
+            new_group["params"] = group["params"]
+            return new_group
+
+        param_groups = [update_group(g, ng) for g, ng in zip(groups, saved_groups)]
+        self.__setstate__({"state": state, "param_groups": param_groups})
+
+    def to_gpu(self):
+        for gindex, group in enumerate(self.param_groups):
+            for pindex, p in enumerate(group["params"]):
+                if p in self.state:
+                    key_id = self.get_state_key(p)
+                    values = self.state[key_id]#{key:tensor}/{key:dict}
+                    counter = p.counter
+                    for k, v in values.items():
+                        if k in self.offloadable_state_tensor_keys:
+                            if isinstance(v, torch.Tensor):
+                                self._set_state_cpu_buffer(key_id, k, v)
+                            elif isinstance(v, dict) and counter in v:
+                                self._set_state_cpu_buffer(key_id, k, v[counter], counter)
+                            continue
+                        if k in self.persistent_device_state_tensor_keys and isinstance(v, torch.Tensor):
+                            self.state[key_id][k] = transfer_to_device(v, p.device)
+                            continue
+                        if isinstance(v, torch.Tensor):
+                            is_paged = getattr(v, "is_paged", False)
+                            if not is_paged:
+                                self.state[key_id][k] = transfer_to_device(v, p.device)
+                        if isinstance(v, dict):
+                            is_paged = getattr(v, "is_paged", False)
+                            if not is_paged:
+                                self.state[key_id][k][counter] = transfer_to_device(v[counter], p.device)
+
+    def check_overrides(self):
+        for module, attr, config in self.mng.module_weight_config_triple:
+            pmodule = getattr(module, attr)
+            assert pmodule is not None
+            assert isinstance(pmodule, torch.Tensor) or isinstance(pmodule, torch.Parameter)
+            found = False
+            for gindex, group in enumerate(self.param_groups):
+                if found:
+                    break
+                for pindex, p in enumerate(group["params"]):
+                    if found:
+                        break
+                    if id(p) == id(pmodule):
+                        # found the matching parameter
+                        # init override
+                        self.mng.pid2config[id(p)] = config
+                        self.mng.index2config[(gindex, pindex)] = self.mng.pid2config[id(p)]
+                        found = True
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Arguments:
+            closure (`Callable`, *optional*, defaults to `None`):
+                A closure that reevaluates the model and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        overflows = []
+
+        if not self.initialized:
+            self.check_overrides()
+            self.to_gpu()  # needed for fairseq pure fp16 training
+            self.initialized = True
+
+        # if self.is_paged: self.page_mng.prefetch_all()
+        for gindex, group in enumerate(self.param_groups):
+            for pindex, p in enumerate(group["params"]):
+                if p.new_grad is None:
+                    continue
+                key_id = self.get_state_key(p)
+                state = self.state[key_id]
+                if len(state) == 0:
+                    self.init_state(group, p, gindex, pindex)
+                else:
+                    self.chunkft_get_state(group, p, gindex, pindex)
+
+                self.prefetch_state(p)
+                self.update_step(group, p, gindex, pindex)
+                if should_sync_cuda():
+                    torch.cuda.synchronize()
+                self.chunkft_offload_state(group, p, gindex, pindex)
+        if self.is_paged:
+            # all paged operation are asynchronous, we need
+            # to sync to make sure all tensors are in the right state
+            if should_sync_cuda():
+                torch.cuda.synchronize()
+
+        return loss
+
+    def get_config(self, gindex, pindex, group):
+        config = {}
+        config["betas"] = group["betas"]
+        config["eps"] = group["eps"]
+        config["weight_decay"] = group["weight_decay"]
+        config["lr"] = group["lr"]
+        config["optim_bits"] = self.args.optim_bits
+        config["min_8bit_size"] = self.args.min_8bit_size
+        config["percentile_clipping"] = self.args.percentile_clipping
+        config["block_wise"] = self.args.block_wise
+        config["max_unorm"] = self.args.max_unorm
+        config["skip_zeros"] = self.args.skip_zeros
+
+        if (gindex, pindex) in self.mng.index2config:
+            config.update(self.mng.index2config[(gindex, pindex)])
+        return config
+
+    def init_state(self, group, p, gindex, pindex):
+        raise NotImplementedError("init_state method needs to be overridden")
+    @torch.no_grad()
+    def chunkft_get_state(self, group, p, gindex, pindex):
+        config = self.get_config(gindex, pindex, group)
+        if config["optim_bits"] == 32:
+            dtype = torch.float32
+        elif config["optim_bits"] == 8:
+            dtype = torch.uint8
+        else:
+            raise NotImplementedError(f'Amount of optimizer bits not supported: {config["optim_bits"]}')
+        
+        if p.numel() < config["min_8bit_size"]:
+            dtype = torch.float32
+
+        key_id = self.get_state_key(p)
+        state = self.state[key_id]
+
+        counter = p.counter
+        bucket_restore_sources = []
+        bucket_restore_metadata = []
+        for state_key in self.non_castable_tensor_keys:
+            if state_key in state:
+                state_value = state[state_key]
+                if isinstance(state_value, dict):
+                    if counter not in state_value:
+                        continue
+                    prefetched_tensor, prefetched_dtype = self._take_prefetched_state_tensor(
+                        key_id,
+                        state_key,
+                        counter,
+                    )
+                    self._ensure_state_cpu_buffer_registered(key_id, state_key, state_value[counter], counter)
+                    self._set_state_cpu_buffer(
+                        key_id,
+                        state_key,
+                        state_value[counter],
+                        counter,
+                        original_dtype=self._get_state_cpu_buffer_dtype(key_id, state_key, counter) or state_value[counter].dtype,
+                    )
+                    if prefetched_tensor is not None:
+                        state[state_key][counter] = restore_optimizer_state_to_device(
+                            prefetched_tensor,
+                            p.device,
+                            dtype=prefetched_dtype,
+                        )
+                    elif isinstance(state_value[counter], torch.Tensor) and state_value[counter].device.type == "cpu":
+                        bucket_restore_sources.append(state_value[counter])
+                        bucket_restore_metadata.append(
+                            (
+                                state_key,
+                                counter,
+                                self._get_state_cpu_buffer_dtype(key_id, state_key, counter),
+                            )
+                        )
+                    else:
+                        state[state_key][counter] = restore_optimizer_state_to_device(
+                            state_value[counter],
+                            p.device,
+                            dtype=self._get_state_cpu_buffer_dtype(key_id, state_key, counter),
+                        )
+                elif isinstance(state_value, torch.Tensor):
+                    if state_key in self.offloadable_state_tensor_keys:
+                        self._ensure_state_cpu_buffer_registered(key_id, state_key, state_value)
+                        self._set_state_cpu_buffer(
+                            key_id,
+                            state_key,
+                            state_value,
+                            original_dtype=self._get_state_cpu_buffer_dtype(key_id, state_key) or state_value.dtype,
+                        )
+                    state[state_key] = restore_optimizer_state_to_device(
+                        state_value,
+                        p.device,
+                        dtype=self._get_state_cpu_buffer_dtype(key_id, state_key),
+                    )
+        if bucket_restore_sources:
+            restored_tensors = bucket_transfer_to_device(bucket_restore_sources, p.device, prefetch=False)
+            for restored_tensor, (state_key, restored_counter, original_dtype) in zip(
+                restored_tensors,
+                bucket_restore_metadata,
+            ):
+                if original_dtype is not None and restored_tensor.dtype != original_dtype:
+                    restored_tensor = restored_tensor.to(original_dtype)
+                state[state_key][restored_counter] = restored_tensor
+    @torch.no_grad()
+    def chunkft_offload_state(self, group, p, gindex, pindex):
+        config = self.get_config(gindex, pindex, group)
+        if config["optim_bits"] == 32:
+            dtype = torch.float32
+        elif config["optim_bits"] == 8:
+            dtype = torch.uint8
+        
+        if p.numel() < config["min_8bit_size"]:
+            dtype = torch.float32
+        
+        key_id = self.get_state_key(p)
+        state = self.state[key_id]
+        counter = p.counter
+
+        for state_key in self.non_castable_tensor_keys:
+            if state_key in state:
+                state_value = state[state_key]
+                if isinstance(state_value, dict):
+                    if counter not in state_value:
+                        continue
+                    self._ensure_state_cpu_buffer_registered(key_id, state_key, state_value[counter], counter)
+                    temp_tensor = state_value[counter]
+                    cached_cpu_buffer = self._get_state_cpu_buffer(key_id, state_key, counter)
+                    offloaded_tensor, original_dtype = offload_optimizer_state_to_cpu(temp_tensor, cached_cpu_buffer)
+                    self.state[key_id][state_key][counter] = offloaded_tensor
+                    if offloaded_tensor.device.type == "cpu":
+                        self._set_state_cpu_buffer(key_id, state_key, offloaded_tensor, counter, original_dtype=original_dtype)
+                    else:
+                        self._clear_state_cpu_buffer(key_id, state_key, counter)
+                    self._clear_prefetched_state_tensor(key_id, state_key, counter)
+                    del temp_tensor
+                elif isinstance(state_value, torch.Tensor) and state_key in self.offloadable_state_tensor_keys:
+                    self._ensure_state_cpu_buffer_registered(key_id, state_key, state_value)
+                    temp_tensor = state_value
+                    cached_cpu_buffer = self._get_state_cpu_buffer(key_id, state_key)
+                    offloaded_tensor, original_dtype = offload_optimizer_state_to_cpu(temp_tensor, cached_cpu_buffer)
+                    self.state[key_id][state_key] = offloaded_tensor
+                    if offloaded_tensor.device.type == "cpu":
+                        self._set_state_cpu_buffer(key_id, state_key, offloaded_tensor, original_dtype=original_dtype)
+                    else:
+                        self._clear_state_cpu_buffer(key_id, state_key)
+                    self._clear_prefetched_state_tensor(key_id, state_key)
+                    del temp_tensor
+        self._prefetch_next_state_tensors(p, key_id, state)
+        with torch.no_grad():
+            p.new_grad = None
+        maybe_empty_cache()
+    def update_step(self, group, p, gindex, pindex):
+        raise NotImplementedError("The update_step method needs to be overridden")
+    def chunk_tensor(self,p):
+        strategy = p.strategy
+        if hasattr(p,"upd_ran"):
+            upd_ran = p.upd_ran
+        else:
+            upd_ran = []
+        if strategy:
+            if len(upd_ran)>0:
+                return p[:,upd_ran[0]:upd_ran[1]]
+            else:
+                return p
+        else:
+            if p.dim() == 2:
+                if len(upd_ran)>0:
+                    return p[upd_ran[0]:upd_ran[1],:]
+                else:
+                    return p
+            else:
+                if len(upd_ran)>0:
+                    return p[upd_ran[0]:upd_ran[1]]
+                else:
+                    return p
+    def get_state_buffer(self, p, dtype=torch.float32):
+        grad = p.new_grad
+        counter = p.counter
+        
+        # if not self.is_paged or p.numel() < 1e5:
+        return torch.zeros_like(grad, dtype=dtype, device=p.device)
+        # else:
+        #     # > 1 MB
+        #     buff = F.get_paged(*p.shape, dtype=dtype, device=p.device)
+        #     F.fill(buff, 0)
+        #     self.page_mng.paged_tensors.append(buff)
+        #     return buff
+
+    def prefetch_state(self, p):
+        if self.is_paged:
+            key_id = self.get_state_key(p)
+            state = self.state[key_id]
+            s1 = state["state1"]
+            is_paged = getattr(s1, "is_paged", False)
+            if is_paged:
+                F.prefetch_tensor(state["state1"])
+                if "state2" in state:
+                    F.prefetch_tensor(state["state2"])
+
+
+class Optimizer2State(Optimizer8bit):
+    def __init__(
+        self,
+        optimizer_name,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        percentile_clipping=100,
+        block_wise=True,
+        max_unorm=0.0,
+        skip_zeros=False,
+        is_paged=False,
+    ):
+        """
+        Base 2-state update optimizer class.
+
+        Arguments:
+            optimizer_name (`str`):
+                The name of the optimizer.
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple`, defaults to (0.9, 0.999)):
+                The beta values for the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value for the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            percentile_clipping (`int`, defaults to 100):
+                Adapts clipping threshold automatically by tracking the last 100 gradient norms and clipping the gradient at a certain percentile to improve stability.
+            block_wise (`bool`, defaults to `True`):
+                Whether to independently quantize each block of tensors to reduce outlier effects and improve stability.
+            max_unorm (`float`, defaults to 0.0):
+                The maximum value to normalize each block with.
+            skip_zeros (`bool`, defaults to `False`):
+                Whether to skip zero values for sparse gradients and models to ensure correct updates.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if isinstance(betas, str):
+            # format: '(beta1, beta2)'
+            betas = betas.replace("(", "").replace(")", "").strip().split(",")
+            betas = [float(b) for b in betas]
+        for i in range(len(betas)):
+            if not 0.0 <= betas[i] < 1.0:
+                raise ValueError(f"Invalid beta parameter at index {i}: {betas[i]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults, optim_bits, is_paged)
+
+        if args is None:
+            args = {}
+            args["optim_bits"] = optim_bits
+            args["percentile_clipping"] = 100
+            args["min_8bit_size"] = min_8bit_size
+            args["percentile_clipping"] = percentile_clipping
+            args["block_wise"] = block_wise
+            args["max_unorm"] = max_unorm
+            args["skip_zeros"] = skip_zeros
+
+            self.args = MockArgs(args)
+        else:
+            self.args = args
+
+        self.optimizer_name = optimizer_name
+
+    @torch.no_grad()
+    def init_state(self, group, p, gindex, pindex):
+        config = self.get_config(gindex, pindex, group)
+
+        if config["optim_bits"] == 32:
+            dtype = torch.float32
+        elif config["optim_bits"] == 8:
+            dtype = torch.uint8
+        else:
+            raise NotImplementedError(f'Amount of optimizer bits not supported: {config["optim_bits"]}')
+
+        if p.numel() < config["min_8bit_size"]:
+            dtype = torch.float32
+        
+        key_id = self.get_state_key(p)
+        state = self.state[key_id]
+        counter = p.counter
+        
+        state["step"] = 0
+
+        if dtype == torch.float32 or (dtype == torch.uint8 and p.numel() < 4096):
+            state["state1"][counter] = self.get_state_buffer(p, dtype=torch.float32)
+            state["state2"][counter] = self.get_state_buffer(p, dtype=torch.float32)
+        
+        elif dtype == torch.uint8:
+            if state["step"] == 0:
+                if "dynamic" not in self.name2qmap:
+                    self.fill_qmap()
+                self.name2qmap["dynamic"] = self.name2qmap["dynamic"].to(p.device)
+                self.name2qmap["udynamic"] = self.name2qmap["udynamic"].to(p.device)
+
+            state["state1"][counter] = self.get_state_buffer(p, dtype=torch.uint8)
+            state["qmap1"] = self.name2qmap["dynamic"]
+
+            state["state2"][counter] = self.get_state_buffer(p, dtype=torch.uint8)
+            state["qmap2"] = self.name2qmap["udynamic"]
+
+            if config["block_wise"]:
+                n = p.numel()
+                blocks = n // 2048
+                blocks += 1 if n % 2048 > 0 else 0
+
+                state["absmax1"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
+                state["absmax2"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
+            else:
+                state["max1"] = torch.zeros((1,), dtype=torch.float32, device=p.device)
+                state["new_max1"] = torch.zeros((1,), dtype=torch.float32, device=p.device)
+                state["max2"] = torch.zeros((1,), dtype=torch.float32, device=p.device)
+                state["new_max2"] = torch.zeros((1,), dtype=torch.float32, device=p.device)
+
+        if config["percentile_clipping"] < 100:
+            state["gnorm_vec"] = torch.zeros((100,), device=p.device)
+
+        if config["max_unorm"] > 0.0:
+            state["unorm_vec"] = torch.zeros((1,), device=p.device)
+
+    @torch.no_grad()
+    def update_step(self, group, p, gindex, pindex):
+        key_id = self.get_state_key(p)
+        state = self.state[key_id]
+        counter = p.counter
+        grad = p.new_grad
+
+        config = self.get_config(gindex, pindex, group)
+
+        state["step"] += 1
+        step = state["step"]
+        if config["percentile_clipping"] < 100:
+            current_gnorm, clip_value, gnorm_scale = F.percentile_clipping(
+                grad,
+                state["gnorm_vec"],
+                step,
+                config["percentile_clipping"],
+            )
+        else:
+            gnorm_scale = 1.0
+        new_p = self.chunk_tensor(p)
+        if state["state1"].dtype == torch.float:
+            F.optimizer_update_32bit(
+                self.optimizer_name,
+                grad,
+                new_p,
+                state["state1"],
+                config["betas"][0],
+                config["eps"],
+                step,
+                config["lr"],
+                state["state2"],
+                config["betas"][1],
+                config["weight_decay"],
+                gnorm_scale,
+                state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                max_unorm=config["max_unorm"],
+                skip_zeros=config["skip_zeros"],
+            )
+
+        elif state["state1"].dtype == torch.uint8 and not config["block_wise"]:
+            F.optimizer_update_8bit(
+                self.optimizer_name,
+                grad,
+                new_p,
+                state["state1"],
+                state["state2"],
+                config["betas"][0],
+                config["betas"][1],
+                config["eps"],
+                step,
+                config["lr"],
+                state["qmap1"],
+                state["qmap2"],
+                state["max1"],
+                state["max2"],
+                state["new_max1"],
+                state["new_max2"],
+                config["weight_decay"],
+                gnorm_scale=gnorm_scale,
+                unorm_vec=state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                max_unorm=config["max_unorm"],
+            )
+
+            # swap maxes
+            state["max1"], state["new_max1"] = state["new_max1"], state["max1"]
+            state["max2"], state["new_max2"] = state["new_max2"], state["max2"]
+        elif state["state1"].dtype == torch.uint8 and config["block_wise"]:
+            F.optimizer_update_8bit_blockwise(
+                self.optimizer_name,
+                grad,
+                new_p,
+                state["state1"],
+                state["state2"],
+                config["betas"][0],
+                config["betas"][1],
+                config["eps"],
+                step,
+                config["lr"],
+                state["qmap1"],
+                state["qmap2"],
+                state["absmax1"],
+                state["absmax2"],
+                config["weight_decay"],
+                gnorm_scale=gnorm_scale,
+                skip_zeros=config["skip_zeros"],
+            )
+
+
+class Optimizer1State(Optimizer8bit):
+    def __init__(
+        self,
+        optimizer_name,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.0),
+        eps=1e-8,
+        weight_decay=0.0,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        percentile_clipping=100,
+        block_wise=True,
+        max_unorm=0.0,
+        skip_zeros=False,
+        is_paged=False,
+    ):
+        """
+        Base 1-state update optimizer class.
+
+        Arguments:
+            optimizer_name (`str`):
+                The name of the optimizer.
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple`, defaults to (0.9, 0.0)):
+                The beta values for the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value for the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            percentile_clipping (`int`, defaults to 100):
+                Adapts clipping threshold automatically by tracking the last 100 gradient norms and clipping the gradient at a certain percentile to improve stability.
+            block_wise (`bool`, defaults to `True`):
+                Whether to independently quantize each block of tensors to reduce outlier effects and improve stability.
+            max_unorm (`float`, defaults to 0.0):
+                The maximum value to normalize each block with.
+            skip_zeros (`bool`, defaults to `False`):
+                Whether to skip zero values for sparse gradients and models to ensure correct updates.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        for i in range(len(betas)):
+            if not 0.0 <= betas[i] < 1.0:
+                raise ValueError(f"Invalid beta parameter at index {i}: {betas[i]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults, optim_bits, is_paged)
+
+        if args is None:
+            args = {}
+            args["optim_bits"] = optim_bits
+            args["percentile_clipping"] = 100
+            args["min_8bit_size"] = min_8bit_size
+            args["percentile_clipping"] = percentile_clipping
+            args["block_wise"] = block_wise
+            args["max_unorm"] = max_unorm
+            args["skip_zeros"] = skip_zeros
+
+            self.args = MockArgs(args)
+        else:
+            self.args = args
+
+        self.optimizer_name = optimizer_name
+
+    @torch.no_grad()
+    def init_state(self, group, p, gindex, pindex):
+        config = self.get_config(gindex, pindex, group)
+
+        if config["optim_bits"] == 32:
+            dtype = torch.float32
+        elif config["optim_bits"] == 8:
+            dtype = torch.uint8
+        else:
+            raise NotImplementedError(f'Amount of optimizer bits not supported: {config["optim_bits"]}')
+
+        if p.numel() < config["min_8bit_size"]:
+            dtype = torch.float32
+        key_id = self.get_state_key(p)
+        state = self.state[key_id]
+        counter = p.counter
+        state["step"] = 0
+
+        if dtype == torch.float32 or (dtype == torch.uint8 and p.numel() < 4096):
+            state["state1"] = self.get_state_buffer(p, dtype=torch.float32)
+        elif dtype == torch.uint8:
+            if state["step"] == 0:
+                if "dynamic" not in self.name2qmap:
+                    self.fill_qmap()
+                self.name2qmap["dynamic"] = self.name2qmap["dynamic"].to(p.device)
+
+            state["state1"] = self.get_state_buffer(p, dtype=torch.uint8)
+            state["qmap1"] = self.name2qmap["dynamic"]
+
+            if config["block_wise"]:
+                n = p.numel()
+                blocks = n // 2048
+                blocks += 1 if n % 2048 > 0 else 0
+
+                state["absmax1"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
+            else:
+                state["max1"] = torch.zeros((1,), dtype=torch.float32, device=p.device)
+                state["new_max1"] = torch.zeros((1,), dtype=torch.float32, device=p.device)
+
+        if config["percentile_clipping"] < 100:
+            state["gnorm_vec"] = torch.zeros((100,), device=p.device)
+
+        if config["max_unorm"] > 0.0:
+            state["unorm_vec"] = torch.zeros((1,), device=p.device)
+
+    @torch.no_grad()
+    def update_step(self, group, p, gindex, pindex):
+        key_id = self.get_state_key(p)
+        state = self.state[key_id]
+        
+        grad = p.new_grad
+
+        config = self.get_config(gindex, pindex, group)
+
+        state["step"] += 1
+        step = state["step"]
+
+        if config["percentile_clipping"] < 100:
+            current_gnorm, clip_value, gnorm_scale = F.percentile_clipping(
+                grad,
+                state["gnorm_vec"],
+                step,
+                config["percentile_clipping"],
+            )
+        else:
+            gnorm_scale = 1.0
+
+        new_p = self.chunk_tensor(p)
+        if state["state1"].dtype == torch.float:
+            F.optimizer_update_32bit(
+                self.optimizer_name,
+                grad,
+                new_p,
+                state["state1"],
+                config["betas"][0],
+                config["eps"],
+                step,
+                config["lr"],
+                None,
+                config["betas"][1],
+                config["weight_decay"],
+                gnorm_scale,
+                state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                max_unorm=config["max_unorm"],
+                skip_zeros=config["skip_zeros"],
+            )
+
+        elif state["state1"].dtype == torch.uint8 and not config["block_wise"]:
+            F.optimizer_update_8bit(
+                self.optimizer_name,
+                grad,
+                new_p,
+                state["state1"],
+                None,
+                config["betas"][0],
+                config["betas"][1],
+                config["eps"],
+                step,
+                config["lr"],
+                state["qmap1"],
+                None,
+                state["max1"],
+                None,
+                state["new_max1"],
+                None,
+                config["weight_decay"],
+                gnorm_scale,
+                state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                max_unorm=config["max_unorm"],
+            )
+
+            state["max1"], state["new_max1"] = state["new_max1"], state["max1"]
+        elif state["state1"].dtype == torch.uint8 and config["block_wise"]:
+            F.optimizer_update_8bit_blockwise(
+                self.optimizer_name,
+                grad,
+                new_p,
+                state["state1"],
+                None,
+                config["betas"][0],
+                config["betas"][1],
+                config["eps"],
+                step,
+                config["lr"],
+                state["qmap1"],
+                None,
+                state["absmax1"],
+                None,
+                config["weight_decay"],
+                gnorm_scale=gnorm_scale,
+                skip_zeros=config["skip_zeros"],
+            )
